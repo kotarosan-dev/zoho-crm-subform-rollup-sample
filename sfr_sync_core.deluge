@@ -1,0 +1,1755 @@
+string standalone.sfr_sync_core(String parentId, String source)
+{
+	// ==================================================================
+	// function_name     : sfr_sync_core
+	// category          : standalone（本体。包み関数から standalone.sfr_sync_core(...) で呼ぶ）
+	// arguments         : parentId (String) SFR_Projects のレコード ID（数字のみ）
+	//                     source   (String) workflow / button / reconcile / delete
+	// return            : String "<結果>;st=<親の状態>;a=<追加>;u=<更新>;d=<削除>;w=<0|1>;n=<行数>;e=<先頭エラー>"
+	//                     結果は success / partial / failed / skipped / out_of_spec
+	// motivation        : サブフォーム Work_Lines の行をミラー SFR_Line_Mirrors へ一方向に差分同期し、
+	//                     ロールアップ3種（SUM・COUNT・MAX）を親へ書き戻す（仕様 v0.2 §6-3）
+	// processing_flow   : 手順1 入力検査 → 手順2 親の単一取得（getRecordById。親不在の厳密判定）→ 手順3 ガード
+	//                     → 手順4 ミラー COQL → 手順5 正規化と Map での振り分け → 手順6 削除ガード
+	//                     → 手順7 削除予定ログの先行 Insert → 手順8 Insert/Update/Delete（100件ずつ）
+	//                     → 手順9 ミラーの読み戻し → 手順10 ロールアップと親への書き戻し（412 は1回だけ手順2から）
+	//                     → 手順11 Modified_Time 再読（巻き戻し検出）→ 手順12 親の読み戻し → 手順13 ログ
+	// related_functions : sfr_sync_mirror（automation）、sfr_resync_button（button）、sfr_reconcile（schedule）
+	// 注意              : 親レコードへサブフォームのキー（Work_Lines）は絶対に送らない（空配列で全行消去の事故防止）
+	// ==================================================================
+	//
+	// ---------- 定数 ----------
+	API_BASE = "https://www.zohoapis.jp/crm/v8";
+	CONN = "crm_module";
+	PARENT_MODULE = "SFR_Projects";
+	SUBFORM_FIELD_API = "Work_Lines";
+	SUBFORM_COQL_API = "Work_Lines";
+	MIRROR_MODULE = "SFR_Line_Mirrors";
+	LOG_MODULE = "SFR_Sync_Logs";
+	MAX_ROWS = 100;
+	FAIL_LIMIT = 3;
+	BATCH_SIZE = 100;
+	MIRROR_COQL_LIMIT = 200;
+	LOG_SKIPPED = true;
+	TEXT_COLLAPSE_SPACES = false;
+	TEXT_MAX = 255;
+	ERROR_DETAIL_MAX = 2000;
+	SNAPSHOT_MAX = 32000;
+	RETURN_ERROR_MAX = 200;
+	ISO_FMT = "yyyy-MM-dd'T'HH:mm:ssXXX";
+	// 親不在とみなす単一 GET の code（P0-04 実測: 削除済みレコードの GET は 204・本文なしで、コードは返らない。判定は EMPTY_RESPONSE との併用＋COQL 件数 0 が決め手）
+	PARENT_GONE_CODE = "INVALID_DATA";
+	CODE_SUCCESS = "SUCCESS";
+	CODE_ALREADY_MODIFIED = "ALREADY_MODIFIED";
+	CODE_TOO_MANY = "TOO_MANY_REQUESTS";
+	ST_SYNCED = "synced";
+	ST_NEEDS_RESYNC = "needs_resync";
+	ST_FAILED = "failed";
+	ST_OUT_OF_SPEC = "out_of_spec";
+	RS_DELETE_PLANNED = "delete_planned";
+	RS_SUCCESS = "success";
+	RS_PARTIAL = "partial";
+	RS_FAILED = "failed";
+	RS_SKIPPED = "skipped";
+	RS_OUT_OF_SPEC = "out_of_spec";
+	SEP = "|^|";
+	// 試験用定数（既定は無効のまま出す。T14: 指定した Mirror_Key の要素だけ失敗させる／T27: 親の書き戻しを失敗させる）
+	TEST_FAIL_MIRROR_KEY = "";
+	TEST_FAIL_PARENT_UPDATE = false;
+	//
+	// ---------- URL ----------
+	coqlUrl = API_BASE + "/coql";
+	parentUrl = API_BASE + "/" + PARENT_MODULE;
+	mirrorUrl = API_BASE + "/" + MIRROR_MODULE;
+	logUrl = API_BASE + "/" + LOG_MODULE;
+	oversizeText = "".leftPad(300).replaceAll(" ", "X");
+	//
+	// ---------- 実行の状態 ----------
+	startedAt = zoho.currenttime.toString(ISO_FMT);
+	runStamp = zoho.currenttime.toString("yyyyMMddHHmmss");
+	pid = ifnull(parentId, "").toString().trim();
+	src = ifnull(source, "").toString().trim();
+	runId = "SYNC-" + runStamp + "-" + pid;
+	if(runId.length() > TEXT_MAX)
+	{
+		runId = runId.subString(0, TEXT_MAX);
+	}
+	resultCode = RS_SUCCESS;
+	errList = List();
+	noteList = List();
+	addedCount = 0;
+	updatedCount = 0;
+	deletedCount = 0;
+	mirrorWriteAttempted = false;
+	mirrorWritten = false;
+	parentKnown = false;
+	parentGone = false;
+	skipFailed = false;
+	parentWritten = false;
+	parentWrittenWithGuard = false;
+	parentFullWrite = false;
+	rollupValid = false;
+	newStatus = "";
+	newTotalNorm = "";
+	newCountNorm = "";
+	curStatus = "";
+	curModified = "";
+	sumVal = "0".toDecimal();
+	rowCount = 0;
+	latestDate = "";
+	snapLogIds = List();
+	logError = "";
+	//
+	// ---------- 手順1: 入力検査（COQL に埋め込むので数字だけか確かめる。知見集 §2.3） ----------
+	validInput = true;
+	if(pid == "")
+	{
+		validInput = false;
+		errList.add("INVALID_PARENT_ID");
+	}
+	else if(pid.replaceAll("[0-9]", "") != "")
+	{
+		validInput = false;
+		errList.add("INVALID_PARENT_ID");
+	}
+	if(src != "workflow" && src != "button" && src != "reconcile" && src != "delete")
+	{
+		validInput = false;
+		errList.add("INVALID_SOURCE");
+	}
+	if(validInput == false)
+	{
+		resultCode = RS_FAILED;
+	}
+	//
+	try
+	{
+		if(validInput == true)
+		{
+			// 412（親が途中で編集された）のときだけ、手順2から1回やり直す
+			attemptSlots = {1,2};
+			retryNeeded = false;
+			for each  attemptNo in attemptSlots
+			{
+				runThis = true;
+				if(attemptNo == 2 && retryNeeded == false)
+				{
+					runThis = false;
+				}
+				if(runThis == true)
+				{
+					retryNeeded = false;
+					resultCode = RS_SUCCESS;
+					errList = List();
+					halt = false;
+					parentKnown = false;
+					parentGone = false;
+					skipFailed = false;
+					rollupValid = false;
+					rows = List();
+					expectedList = List();
+					expectedKeys = Map();
+					insertList = List();
+					updateList = List();
+					deleteList = List();
+					staleCount = 0;
+					dupCount = 0;
+					uniqueMirrorCount = 0;
+					sumVal = "0".toDecimal();
+					rowCount = 0;
+					latestDate = "";
+					latestNum = 0;
+					curFail = 0;
+					curError = "";
+					curTotalNorm = "";
+					curCountNorm = "";
+					curLatest = "";
+					curStatus = "";
+					curModified = "";
+					curName = "";
+					//
+					// ---------- 手順2: 親の単一取得（getRecordById。サブフォームは単一取得でだけ返る。知見集 §2.2） ----------
+					// 実測（2026-11-10〜11）: invokeurl GET の JSON では 0 行のサブフォームが null で返る（キーあり・値 null）。
+					// zoho.crm.getRecordById では 0 行でも空の List で返るため、親の読み取りはこちらを使う。
+					// 親不在の判定に使うエラーコードは、例外時に invokeurl GET で別途取る。
+					parentRec = Map();
+					parentKnown = false;
+					getErrCode = "";
+					try
+					{
+						gotRec = zoho.crm.getRecordById(PARENT_MODULE,pid.toLong());
+						if(gotRec != null)
+						{
+							gotId = ifnull(gotRec.get("id"),"").toString();
+							if(gotId != "")
+							{
+								if(gotId.toLong() == pid.toLong())
+								{
+									parentRec = gotRec;
+									parentKnown = true;
+								}
+							}
+						}
+						if(parentKnown == false)
+						{
+							getErrCode = "GETRECORD_EMPTY";
+						}
+					}
+					catch (recEx)
+					{
+						getErrCode = "GETRECORD_EXCEPTION";
+					}
+					if(parentKnown == false)
+					{
+						// 親不在の判定用に、invokeurl GET でエラーコードだけを取り直す
+						getUrl = parentUrl + "/" + pid;
+						getResp = invokeurl
+						[
+							url :getUrl
+							type :GET
+							connection:"crm_module"
+						];
+						getStr = ifnull(getResp,"").toString();
+						if(getStr == "")
+						{
+							getErrCode = "EMPTY_RESPONSE";
+						}
+						else
+						{
+							getMap = getStr.toMap();
+							getData = getMap.get("data");
+							if(getData != null)
+							{
+								if(getData.size() > 0)
+								{
+									probeFirst = getData.get(0);
+									probeCode = ifnull(probeFirst.get("code"),"").toString();
+									if(probeCode != "")
+									{
+										getErrCode = probeCode;
+									}
+									else
+									{
+										getErrCode = "RECORD_FOUND_BUT_UNREADABLE";
+									}
+								}
+								else
+								{
+									getErrCode = "EMPTY_DATA";
+								}
+							}
+							else
+							{
+								getErrCode = ifnull(getMap.get("code"),"UNKNOWN").toString();
+							}
+						}
+					}
+					//
+					// 親不在の厳密な判定: GET が PARENT_GONE_CODE か EMPTY_RESPONSE（削除済みは 204 で本文なし。P0-04 実測）で、かつ COQL の COUNT(id) の本文が 0。それ以外は failed
+					if(parentKnown == false)
+					{
+						halt = true;
+						goneConfirmed = false;
+						goneCount = "";
+						if(getErrCode == PARENT_GONE_CODE || getErrCode == "EMPTY_RESPONSE")
+						{
+							gq = "select COUNT(id) from " + PARENT_MODULE + " where id = '" + pid + "'";
+							gBody = Map();
+							gBody.put("select_query",gq);
+							gBodyStr = gBody.toString();
+							gResp = invokeurl
+							[
+								url :coqlUrl
+								type :POST
+								parameters:gBodyStr
+								connection:"crm_module"
+							];
+							gStr = ifnull(gResp,"").toString();
+							if(gStr != "")
+							{
+								gMap = gStr.toMap();
+								gData = gMap.get("data");
+								if(gData != null)
+								{
+									if(gData.size() > 0)
+									{
+										gFirst = gData.get(0);
+										goneCount = ifnull(gFirst.get("COUNT(id)"),"").toString();
+										if(goneCount == "0")
+										{
+											goneConfirmed = true;
+										}
+									}
+								}
+							}
+						}
+						if(goneConfirmed == true)
+						{
+							parentGone = true;
+							halt = false;
+							noteList.add("PARENT_GONE get_code=" + getErrCode + " coql_count=0");
+						}
+						else
+						{
+							resultCode = RS_FAILED;
+							errList.add("PARENT_GET_FAILED code=" + getErrCode + " coql_count=" + goneCount);
+						}
+					}
+					//
+					if(parentKnown == true)
+					{
+						curModified = ifnull(parentRec.get("Modified_Time"),"").toString();
+						curName = ifnull(parentRec.get("Name"),"").toString();
+						curStatus = ifnull(parentRec.get("Mirror_Sync_Status"),"").toString();
+						curError = ifnull(parentRec.get("Mirror_Last_Error"),"").toString();
+						curFailRaw = ifnull(parentRec.get("Mirror_Fail_Count"),"").toString().trim();
+						if(curFailRaw != "")
+						{
+							curFail = curFailRaw.toLong();
+						}
+						curTotalRaw = ifnull(parentRec.get("Rollup_Total_Amount"),"").toString().trim();
+						if(curTotalRaw != "")
+						{
+							curTotalNorm = curTotalRaw.toDecimal().round(2).toString();
+						}
+						curCountRaw = ifnull(parentRec.get("Rollup_Line_Count"),"").toString().trim();
+						if(curCountRaw != "")
+						{
+							curCountNorm = curCountRaw.toLong().toString();
+						}
+						curLatest = ifnull(parentRec.get("Rollup_Latest_Work_Date"),"").toString().trim();
+						//
+						// failed（手動対応）の親は、workflow・reconcile からは自動同期しない（D28）。button は常に実行
+						if(curStatus == ST_FAILED)
+						{
+							if(src == "workflow" || src == "reconcile")
+							{
+								halt = true;
+								skipFailed = true;
+								resultCode = RS_SKIPPED;
+								noteList.add("SKIP_FAILED_PARENT fail_count=" + curFail);
+							}
+						}
+						//
+						// ---------- 手順3: ガード ----------
+						// サブフォームのキーが無い・null は「0 件」と読まずに中断（レイアウトから外すと返らない。知見集 §8）
+						if(halt == false)
+						{
+							subVal = parentRec.get(SUBFORM_FIELD_API);
+							if(subVal == null)
+							{
+								halt = true;
+								resultCode = RS_FAILED;
+								errList.add("SUBFORM_KEY_MISSING");
+							}
+							else
+							{
+								// 値が List かは toString の先頭文字では判定できない（Deluge の List の toString は "[" で始まらない。
+								// 実測 2026-11-10〜11）。getRecordById では行あり・0 行とも List で返るため、そのまま行として扱い、
+								// 行の中身の妥当性は後の正規化（行 ID の検査）で担保する。
+								rows = subVal;
+							}
+						}
+						// 行数が MAX_ROWS 超は仕様外。ログに残して止める（D17）
+						if(halt == false)
+						{
+							rowCount = rows.size();
+							if(rowCount > MAX_ROWS)
+							{
+								halt = true;
+								resultCode = RS_OUT_OF_SPEC;
+								errList.add("OUT_OF_SPEC rows=" + rowCount + " max=" + MAX_ROWS);
+							}
+						}
+						//
+						// サブフォーム行の正規化（§6-3-1）とロールアップの計算（D12・D13）。並び順は GET の配列順だけで決める
+						if(halt == false)
+						{
+							rowIdx = 0;
+							for each  sfRow in rows
+							{
+								if(halt == false)
+								{
+									rowIdx = rowIdx + 1;
+									rid = ifnull(sfRow.get("id"),"").toString().trim();
+									ridOk = true;
+									if(rid == "")
+									{
+										ridOk = false;
+									}
+									else if(rid.replaceAll("[0-9]","") != "")
+									{
+										ridOk = false;
+									}
+									if(ridOk == false)
+									{
+										halt = true;
+										resultCode = RS_FAILED;
+										errList.add("ROW_ID_MISSING index=" + rowIdx);
+									}
+									else
+									{
+										rKey = pid + ":" + rid;
+										if(expectedKeys.containKey(rKey))
+										{
+											halt = true;
+											resultCode = RS_FAILED;
+											errList.add("DUPLICATE_ROW_ID key=" + rKey);
+										}
+										else
+										{
+											expectedKeys.put(rKey,rowIdx);
+											lineRaw = ifnull(sfRow.get("Line_Item"),"").toString();
+											lineNorm = lineRaw;
+											if(TEXT_COLLAPSE_SPACES == true)
+											{
+												lineNorm = lineRaw.replaceAll(" +"," ").trim();
+											}
+											amtRaw = ifnull(sfRow.get("Amount"),"").toString().trim();
+											amtNorm = "";
+											if(amtRaw != "")
+											{
+												amtDec = amtRaw.toDecimal().round(2);
+												amtNorm = amtDec.toString();
+												sumVal = sumVal + amtDec;
+											}
+											wd = ifnull(sfRow.get("Work_Date"),"").toString().trim();
+											if(wd != "")
+											{
+												wdDigits = wd.replaceAll("-","");
+												if(wdDigits.length() == 8)
+												{
+													if(wdDigits.replaceAll("[0-9]","") == "")
+													{
+														wdNum = wdDigits.toLong();
+														if(wdNum > latestNum)
+														{
+															latestNum = wdNum;
+															latestDate = wd;
+														}
+													}
+												}
+											}
+											idxNorm = rowIdx.toString();
+											rowSig = lineNorm + SEP + amtNorm + SEP + wd + SEP + idxNorm;
+											expRow = Map();
+											expRow.put("key",rKey);
+											expRow.put("rid",rid);
+											expRow.put("sig",rowSig);
+											expRow.put("line",lineRaw);
+											expRow.put("amt",amtNorm);
+											expRow.put("date",wd);
+											expRow.put("idx",rowIdx);
+											expectedList.add(expRow);
+										}
+									}
+								}
+							}
+							if(halt == false)
+							{
+								rollupValid = true;
+							}
+						}
+					}
+					//
+					// ---------- 手順4: 既存ミラーを COQL で取得（WHERE 必須・LIMIT 200。0 件は 204） ----------
+					mirrors = List();
+					if(halt == false)
+					{
+						mq = "select id, Mirror_Key, Subform_Row_Id, Row_Index, Line_Item, Amount, Work_Date from " + MIRROR_MODULE + " where Parent_Record_Id = '" + pid + "' limit " + MIRROR_COQL_LIMIT;
+						mBody = Map();
+						mBody.put("select_query",mq);
+						mBodyStr = mBody.toString();
+						mResp = invokeurl
+						[
+							url :coqlUrl
+							type :POST
+							parameters:mBodyStr
+							connection:"crm_module"
+						];
+						mStr = ifnull(mResp,"").toString();
+						if(mStr != "")
+						{
+							mMap = mStr.toMap();
+							mCode = ifnull(mMap.get("code"),"").toString();
+							if(mCode != "")
+							{
+								halt = true;
+								resultCode = RS_FAILED;
+								errList.add("MIRROR_COQL_FAILED code=" + mCode);
+							}
+							else
+							{
+								mData = mMap.get("data");
+								if(mData != null)
+								{
+									mirrors = mData;
+								}
+								mInfo = mMap.get("info");
+								if(mInfo != null)
+								{
+									mMore = ifnull(mInfo.get("more_records"),"").toString();
+									if(mMore == "true")
+									{
+										halt = true;
+										resultCode = RS_FAILED;
+										errList.add("MIRROR_OVERFLOW more_records=true limit=" + MIRROR_COQL_LIMIT);
+									}
+								}
+							}
+						}
+					}
+					//
+					// ---------- 手順5: 正規化と振り分け（Mirror_Key をキーにした Map。入れ子のループにしない） ----------
+					if(halt == false)
+					{
+						mirrorMap = Map();
+						for each  mRec in mirrors
+						{
+							mId = ifnull(mRec.get("id"),"").toString();
+							mKey = ifnull(mRec.get("Mirror_Key"),"").toString();
+							mLineRaw = ifnull(mRec.get("Line_Item"),"").toString();
+							mLineNorm = mLineRaw;
+							if(TEXT_COLLAPSE_SPACES == true)
+							{
+								mLineNorm = mLineRaw.replaceAll(" +"," ").trim();
+							}
+							mAmtRaw = ifnull(mRec.get("Amount"),"").toString().trim();
+							mAmtNorm = "";
+							if(mAmtRaw != "")
+							{
+								mAmtNorm = mAmtRaw.toDecimal().round(2).toString();
+							}
+							mDate = ifnull(mRec.get("Work_Date"),"").toString().trim();
+							mIdxRaw = ifnull(mRec.get("Row_Index"),"").toString().trim();
+							mIdxNorm = "";
+							if(mIdxRaw != "")
+							{
+								mIdxNorm = mIdxRaw.toLong().toString();
+							}
+							mSig = mLineNorm + SEP + mAmtNorm + SEP + mDate + SEP + mIdxNorm;
+							mm = Map();
+							mm.put("id",mId);
+							mm.put("key",mKey);
+							mm.put("sig",mSig);
+							mm.put("line",mLineRaw);
+							mm.put("amt",mAmtNorm);
+							mm.put("date",mDate);
+							mm.put("idx",mIdxNorm);
+							if(mKey == "")
+							{
+								// キーの無い壊れたミラーは削除に回す（割合ガードの母数には入れない）
+								deleteList.add(mm);
+								dupCount = dupCount + 1;
+							}
+							else if(mirrorMap.containKey(mKey))
+							{
+								// 重複: ID の大きい方を削除に入れる
+								prevMm = mirrorMap.get(mKey);
+								prevId = ifnull(prevMm.get("id"),"0").toString();
+								dupCount = dupCount + 1;
+								if(mId.toLong() > prevId.toLong())
+								{
+									deleteList.add(mm);
+								}
+								else
+								{
+									deleteList.add(prevMm);
+									mirrorMap.put(mKey,mm);
+								}
+							}
+							else
+							{
+								mirrorMap.put(mKey,mm);
+							}
+						}
+						uniqueMirrorCount = mirrorMap.size();
+						//
+						for each  expRow in expectedList
+						{
+							eKey = expRow.get("key");
+							eSig = expRow.get("sig");
+							eIdx = expRow.get("idx");
+							lineVal = expRow.get("line");
+							amtVal = expRow.get("amt");
+							dateVal = expRow.get("date");
+							if(TEST_FAIL_MIRROR_KEY != "")
+							{
+								if(TEST_FAIL_MIRROR_KEY == eKey)
+								{
+									lineVal = oversizeText;
+									eSig = "TEST_FORCE_UPDATE";
+								}
+							}
+							// Name はミラーのキーから生成し 255 文字以内（親 Name の側を切り詰める）
+							nameSuffix = "#" + eKey;
+							headMax = TEXT_MAX - nameSuffix.length();
+							nameHead = curName;
+							if(nameHead.length() > headMax)
+							{
+								nameHead = nameHead.subString(0,headMax);
+							}
+							mirrorName = nameHead + nameSuffix;
+							rec = Map();
+							rec.put("Name",mirrorName);
+							rec.put("Mirror_Key",eKey);
+							if(lineVal == "")
+							{
+								rec.put("Line_Item",null);
+							}
+							else
+							{
+								rec.put("Line_Item",lineVal);
+							}
+							if(amtVal == "")
+							{
+								rec.put("Amount",null);
+							}
+							else
+							{
+								rec.put("Amount",amtVal.toDecimal());
+							}
+							if(dateVal == "")
+							{
+								rec.put("Work_Date",null);
+							}
+							else
+							{
+								rec.put("Work_Date",dateVal);
+							}
+							rec.put("Row_Index",eIdx);
+							if(mirrorMap.containKey(eKey))
+							{
+								curM = mirrorMap.get(eKey);
+								curSig = curM.get("sig");
+								if(curSig != eSig)
+								{
+									rec.put("id",curM.get("id"));
+									updateList.add(rec);
+								}
+								mirrorMap.remove(eKey);
+							}
+							else
+							{
+								lookupVal = Map();
+								lookupVal.put("id",pid);
+								rec.put("Parent_Project",lookupVal);
+								rec.put("Parent_Record_Id",pid);
+								rec.put("Subform_Row_Id",expRow.get("rid"));
+								insertList.add(rec);
+							}
+						}
+						// Map に残ったものが削除
+						leftKeys = mirrorMap.keys();
+						for each  leftKey in leftKeys
+						{
+							deleteList.add(mirrorMap.get(leftKey));
+							staleCount = staleCount + 1;
+						}
+					}
+					//
+					// ---------- 手順6: 削除のガード（親不在が確定した場合は対象外） ----------
+					if(halt == false && parentGone == false)
+					{
+						if(expectedList.size() == 0 && deleteList.size() > 0)
+						{
+							// 全件削除: サブフォームへの COUNT(id) の本文が 0 を返すことを確かめてから進む
+							cq = "select COUNT(id) from " + SUBFORM_COQL_API + " where Parent_Id = '" + pid + "'";
+							cBody = Map();
+							cBody.put("select_query",cq);
+							cBodyStr = cBody.toString();
+							cResp = invokeurl
+							[
+								url :coqlUrl
+								type :POST
+								parameters:cBodyStr
+								connection:"crm_module"
+							];
+							cStr = ifnull(cResp,"").toString();
+							cCount = "";
+							if(cStr != "")
+							{
+								cMap = cStr.toMap();
+								cData = cMap.get("data");
+								if(cData != null)
+								{
+									if(cData.size() > 0)
+									{
+										cFirst = cData.get(0);
+										cCount = ifnull(cFirst.get("COUNT(id)"),"").toString();
+									}
+								}
+							}
+							if(cCount != "0")
+							{
+								halt = true;
+								resultCode = RS_FAILED;
+								errList.add("ALL_DELETE_UNCONFIRMED subform_count=" + cCount);
+							}
+							else
+							{
+								noteList.add("ALL_DELETE_CONFIRMED subform_count=0");
+							}
+						}
+					}
+					if(halt == false && parentGone == false)
+					{
+						insCnt = insertList.size();
+						if(insCnt > 0)
+						{
+							// 削除割合: 削除が既存ミラーの過半で、追加もあるときは中断（BULK_REPLACE_GUARD）
+							if(staleCount * 2 > uniqueMirrorCount)
+							{
+								halt = true;
+								resultCode = RS_FAILED;
+								errList.add("BULK_REPLACE_GUARD delete=" + staleCount + " existing=" + uniqueMirrorCount + " insert=" + insCnt);
+							}
+						}
+					}
+					//
+					// ---------- 手順7: 削除予定ログを先に Insert（失敗したら削除しない） ----------
+					if(halt == false && deleteList.size() > 0)
+					{
+						chunks = List();
+						curChunk = "";
+						for each  dm in deleteList
+						{
+							snap = Map();
+							snap.put("Mirror_Key",dm.get("key"));
+							snap.put("mirror_id",dm.get("id"));
+							snap.put("Line_Item",dm.get("line"));
+							snap.put("Amount",dm.get("amt"));
+							snap.put("Work_Date",dm.get("date"));
+							snap.put("Row_Index",dm.get("idx"));
+							entry = snap.toString();
+							candidate = entry;
+							if(curChunk != "")
+							{
+								candidate = curChunk + "," + entry;
+							}
+							candLen = candidate.length() + 2;
+							if(candLen > SNAPSHOT_MAX && curChunk != "")
+							{
+								chunks.add("[" + curChunk + "]");
+								curChunk = entry;
+							}
+							else
+							{
+								curChunk = candidate;
+							}
+						}
+						if(curChunk != "")
+						{
+							chunks.add("[" + curChunk + "]");
+						}
+						plannedCount = deleteList.size();
+						snapRecs = List();
+						chunkNo = 0;
+						for each  ch in chunks
+						{
+							chunkNo = chunkNo + 1;
+							sName = runId + "-a" + attemptNo + "#" + chunkNo;
+							if(sName.length() > TEXT_MAX)
+							{
+								sName = sName.subString(0,TEXT_MAX);
+							}
+							lr = Map();
+							lr.put("Name",sName);
+							lr.put("Parent_Record_Id",pid);
+							lr.put("Sync_Source",src);
+							lr.put("Sync_Result",RS_DELETE_PLANNED);
+							lr.put("Deleted_Count",plannedCount);
+							lr.put("Deleted_Snapshot",ch);
+							lr.put("Started_At",startedAt);
+							snapRecs.add(lr);
+						}
+						sBody = Map();
+						sBody.put("data",snapRecs);
+						sBody.put("trigger",List());
+						sBodyStr = sBody.toString();
+						sResp = invokeurl
+						[
+							url :logUrl
+							type :POST
+							parameters:sBodyStr
+							connection:"crm_module"
+						];
+						sStr = ifnull(sResp,"").toString();
+						snapOk = true;
+						snapErr = "";
+						if(sStr == "")
+						{
+							snapOk = false;
+							snapErr = "EMPTY_RESPONSE";
+						}
+						else
+						{
+							sMap = sStr.toMap();
+							sData = sMap.get("data");
+							if(sData == null)
+							{
+								snapOk = false;
+								snapErr = ifnull(sMap.get("code"),"UNKNOWN").toString();
+							}
+							else
+							{
+								sOkCount = 0;
+								for each  sEl in sData
+								{
+									sCode = ifnull(sEl.get("code"),"").toString();
+									if(sCode == CODE_SUCCESS)
+									{
+										sDetails = sEl.get("details");
+										if(sDetails != null)
+										{
+											sNewId = ifnull(sDetails.get("id"),"").toString();
+											if(sNewId != "")
+											{
+												snapLogIds.add(sNewId);
+											}
+										}
+										sOkCount = sOkCount + 1;
+									}
+									else
+									{
+										snapOk = false;
+										snapErr = sCode;
+									}
+								}
+								if(sOkCount < snapRecs.size())
+								{
+									snapOk = false;
+								}
+							}
+						}
+						if(snapOk == false)
+						{
+							halt = true;
+							resultCode = RS_FAILED;
+							errList.add("SNAPSHOT_LOG_FAILED code=" + snapErr);
+						}
+					}
+					//
+					// ---------- 手順8: Insert → Update → Delete（100件ずつ。要素ごとの code を確認） ----------
+					tooMany = false;
+					writeFailCount = 0;
+					if(halt == false)
+					{
+						opNames = {"insert","update","delete"};
+						for each  op in opNames
+						{
+							opList = List();
+							if(op == "insert")
+							{
+								opList = insertList;
+							}
+							else if(op == "update")
+							{
+								opList = updateList;
+							}
+							else
+							{
+								opList = deleteList;
+							}
+							batches = List();
+							curBatch = List();
+							for each  oItem in opList
+							{
+								curBatch.add(oItem);
+								if(curBatch.size() >= BATCH_SIZE)
+								{
+									batches.add(curBatch);
+									curBatch = List();
+								}
+							}
+							if(curBatch.size() > 0)
+							{
+								batches.add(curBatch);
+							}
+							for each  batch in batches
+							{
+								if(tooMany == false)
+								{
+									mirrorWriteAttempted = true;
+									batchSize = batch.size();
+									if(op == "insert")
+									{
+										wBody = Map();
+										wBody.put("data",batch);
+										wBody.put("trigger",List());
+										wBodyStr = wBody.toString();
+										wResp = invokeurl
+										[
+											url :mirrorUrl
+											type :POST
+											parameters:wBodyStr
+											connection:"crm_module"
+										];
+									}
+									else if(op == "update")
+									{
+										wBody = Map();
+										wBody.put("data",batch);
+										wBody.put("trigger",List());
+										wBodyStr = wBody.toString();
+										wResp = invokeurl
+										[
+											url :mirrorUrl
+											type :PUT
+											parameters:wBodyStr
+											connection:"crm_module"
+										];
+									}
+									else
+									{
+										idsStr = "";
+										for each  dItem in batch
+										{
+											dId = ifnull(dItem.get("id"),"").toString();
+											dKey = ifnull(dItem.get("key"),"").toString();
+											if(TEST_FAIL_MIRROR_KEY != "")
+											{
+												if(TEST_FAIL_MIRROR_KEY == dKey)
+												{
+													dId = "1";
+												}
+											}
+											if(idsStr == "")
+											{
+												idsStr = dId;
+											}
+											else
+											{
+												idsStr = idsStr + "," + dId;
+											}
+										}
+										delUrl = mirrorUrl + "?ids=" + idsStr;
+										wResp = invokeurl
+										[
+											url :delUrl
+											type :DELETE
+											connection:"crm_module"
+										];
+									}
+									wStr = ifnull(wResp,"").toString();
+									wTop = "";
+									wData = List();
+									if(wStr == "")
+									{
+										wTop = "EMPTY_RESPONSE";
+									}
+									else
+									{
+										wMap = wStr.toMap();
+										wDataRaw = wMap.get("data");
+										if(wDataRaw == null)
+										{
+											wTop = ifnull(wMap.get("code"),"UNKNOWN").toString();
+										}
+										else
+										{
+											wData = wDataRaw;
+										}
+									}
+									if(wTop != "")
+									{
+										writeFailCount = writeFailCount + batchSize;
+										errList.add(op + " batch_failed code=" + wTop + " size=" + batchSize);
+										if(wTop == CODE_TOO_MANY)
+										{
+											tooMany = true;
+										}
+									}
+									else
+									{
+										pos = 0;
+										for each  wEl in wData
+										{
+											elCode = ifnull(wEl.get("code"),"").toString();
+											elKey = "";
+											if(pos < batchSize)
+											{
+												bItem = batch.get(pos);
+												if(op == "delete")
+												{
+													elKey = ifnull(bItem.get("key"),"").toString();
+												}
+												else
+												{
+													elKey = ifnull(bItem.get("Mirror_Key"),"").toString();
+												}
+											}
+											if(elCode == CODE_SUCCESS)
+											{
+												mirrorWritten = true;
+												if(op == "insert")
+												{
+													addedCount = addedCount + 1;
+												}
+												else if(op == "update")
+												{
+													updatedCount = updatedCount + 1;
+												}
+												else
+												{
+													deletedCount = deletedCount + 1;
+												}
+											}
+											else
+											{
+												writeFailCount = writeFailCount + 1;
+												elMsg = ifnull(wEl.get("message"),"").toString();
+												elDetails = ifnull(wEl.get("details"),"").toString();
+												errList.add(op + " key=" + elKey + " code=" + elCode + " msg=" + elMsg + " details=" + elDetails);
+												if(elCode == CODE_TOO_MANY)
+												{
+													tooMany = true;
+												}
+											}
+											pos = pos + 1;
+										}
+										if(pos < batchSize)
+										{
+											missingEl = batchSize - pos;
+											writeFailCount = writeFailCount + missingEl;
+											errList.add(op + " response_missing=" + missingEl);
+										}
+									}
+								}
+							}
+						}
+						if(writeFailCount > 0 || tooMany == true)
+						{
+							resultCode = RS_PARTIAL;
+						}
+						if(tooMany == true)
+						{
+							noteList.add("TOO_MANY_REQUESTS: 残りの書き込みを中止し needs_resync で照合に任せる");
+						}
+					}
+					//
+					// ---------- 手順9: 読み戻し検証（ミラーに書き込みがあったときだけ） ----------
+					if(halt == false && mirrorWriteAttempted == true)
+					{
+						rbBody = Map();
+						rbBody.put("select_query",mq);
+						rbBodyStr = rbBody.toString();
+						rbResp = invokeurl
+						[
+							url :coqlUrl
+							type :POST
+							parameters:rbBodyStr
+							connection:"crm_module"
+						];
+						rbStr = ifnull(rbResp,"").toString();
+						rbList = List();
+						rbFailed = false;
+						if(rbStr != "")
+						{
+							rbMapResp = rbStr.toMap();
+							rbCode = ifnull(rbMapResp.get("code"),"").toString();
+							if(rbCode != "")
+							{
+								rbFailed = true;
+								errList.add("READBACK_COQL_FAILED code=" + rbCode);
+							}
+							else
+							{
+								rbData = rbMapResp.get("data");
+								if(rbData != null)
+								{
+									rbList = rbData;
+								}
+							}
+						}
+						if(rbFailed == false)
+						{
+							rbSigMap = Map();
+							rbDup = 0;
+							for each  rb in rbList
+							{
+								rbKey = ifnull(rb.get("Mirror_Key"),"").toString();
+								rbLineRaw = ifnull(rb.get("Line_Item"),"").toString();
+								rbLineNorm = rbLineRaw;
+								if(TEXT_COLLAPSE_SPACES == true)
+								{
+									rbLineNorm = rbLineRaw.replaceAll(" +"," ").trim();
+								}
+								rbAmtRaw = ifnull(rb.get("Amount"),"").toString().trim();
+								rbAmtNorm = "";
+								if(rbAmtRaw != "")
+								{
+									rbAmtNorm = rbAmtRaw.toDecimal().round(2).toString();
+								}
+								rbDate = ifnull(rb.get("Work_Date"),"").toString().trim();
+								rbIdxRaw = ifnull(rb.get("Row_Index"),"").toString().trim();
+								rbIdxNorm = "";
+								if(rbIdxRaw != "")
+								{
+									rbIdxNorm = rbIdxRaw.toLong().toString();
+								}
+								rbSig = rbLineNorm + SEP + rbAmtNorm + SEP + rbDate + SEP + rbIdxNorm;
+								if(rbSigMap.containKey(rbKey))
+								{
+									rbDup = rbDup + 1;
+								}
+								else
+								{
+									rbSigMap.put(rbKey,rbSig);
+								}
+							}
+							rbMissing = 0;
+							rbMismatch = 0;
+							for each  expRow in expectedList
+							{
+								xKey = expRow.get("key");
+								xSig = expRow.get("sig");
+								if(rbSigMap.containKey(xKey) == false)
+								{
+									rbMissing = rbMissing + 1;
+								}
+								else
+								{
+									gotSig = rbSigMap.get(xKey);
+									if(gotSig != xSig)
+									{
+										rbMismatch = rbMismatch + 1;
+									}
+									rbSigMap.remove(xKey);
+								}
+							}
+							rbExtra = rbSigMap.size();
+							rbIssues = rbMissing + rbMismatch + rbExtra + rbDup;
+							if(rbIssues > 0)
+							{
+								// 重複・余分は次回の同期（または照合）がスナップショットを先に書いてから消す
+								errList.add("READBACK missing=" + rbMissing + " mismatch=" + rbMismatch + " extra=" + rbExtra + " dup=" + rbDup);
+								if(resultCode == RS_SUCCESS)
+								{
+									resultCode = RS_PARTIAL;
+								}
+							}
+						}
+						else
+						{
+							if(resultCode == RS_SUCCESS)
+							{
+								resultCode = RS_PARTIAL;
+							}
+						}
+					}
+					//
+					// ---------- 手順10: ロールアップと親への書き戻し（判定は5項目だけ。D14） ----------
+					if(parentKnown == true && skipFailed == false)
+					{
+						isFailPath = false;
+						if(resultCode == RS_OUT_OF_SPEC)
+						{
+							newStatus = ST_OUT_OF_SPEC;
+						}
+						else if(resultCode == RS_SUCCESS)
+						{
+							newStatus = ST_SYNCED;
+						}
+						else
+						{
+							isFailPath = true;
+							newStatus = ST_NEEDS_RESYNC;
+						}
+						newFail = curFail;
+						if(isFailPath == true)
+						{
+							newFail = curFail + 1;
+							if(newFail >= FAIL_LIMIT)
+							{
+								newStatus = ST_FAILED;
+							}
+						}
+						if(resultCode == RS_SUCCESS)
+						{
+							newFail = 0;
+						}
+						newError = "";
+						if(resultCode != RS_SUCCESS)
+						{
+							for each  er in errList
+							{
+								if(newError == "")
+								{
+									newError = er;
+								}
+								else
+								{
+									newError = newError + " / " + er;
+								}
+							}
+							if(newError.length() > TEXT_MAX)
+							{
+								newError = newError.subString(0,TEXT_MAX);
+							}
+						}
+						roundedSum = sumVal.round(2);
+						newTotalNorm = roundedSum.toString();
+						newCountNorm = rowCount.toString();
+						changed = false;
+						if(rollupValid == true)
+						{
+							if(newTotalNorm != curTotalNorm)
+							{
+								changed = true;
+							}
+							if(newCountNorm != curCountNorm)
+							{
+								changed = true;
+							}
+							if(latestDate != curLatest)
+							{
+								changed = true;
+							}
+						}
+						if(newStatus != curStatus)
+						{
+							changed = true;
+						}
+						if(newError != curError)
+						{
+							changed = true;
+						}
+						doWrite = false;
+						if(isFailPath == true)
+						{
+							doWrite = true;
+						}
+						else if(changed == true)
+						{
+							doWrite = true;
+						}
+						else if(resultCode == RS_SUCCESS && curFail != 0)
+						{
+							doWrite = true;
+						}
+						if(doWrite == true)
+						{
+							pRec = Map();
+							pRec.put("id",pid);
+							if(rollupValid == true)
+							{
+								pRec.put("Rollup_Total_Amount",roundedSum);
+								pRec.put("Rollup_Line_Count",rowCount);
+								if(latestDate == "")
+								{
+									pRec.put("Rollup_Latest_Work_Date",null);
+								}
+								else
+								{
+									pRec.put("Rollup_Latest_Work_Date",latestDate);
+								}
+							}
+							pRec.put("Mirror_Sync_Status",newStatus);
+							if(newError == "")
+							{
+								pRec.put("Mirror_Last_Error",null);
+							}
+							else
+							{
+								pRec.put("Mirror_Last_Error",newError);
+							}
+							pRec.put("Mirror_Fail_Count",newFail);
+							if(resultCode == RS_SUCCESS)
+							{
+								// Mirror_Last_Synced_At は「値が変わった同期の時刻」。親へ書く成功時だけ更新する
+								syncedAt = zoho.currenttime.toString(ISO_FMT);
+								pRec.put("Mirror_Last_Synced_At",syncedAt);
+							}
+							if(TEST_FAIL_PARENT_UPDATE == true)
+							{
+								pRec.put("Mirror_Last_Error",oversizeText);
+							}
+							// サブフォームのキーは絶対に送らない（空配列で全行が消える。知見集 §3.5）
+							if(pRec.containKey(SUBFORM_FIELD_API))
+							{
+								pRec.remove(SUBFORM_FIELD_API);
+							}
+							pList = List();
+							pList.add(pRec);
+							pBody = Map();
+							pBody.put("data",pList);
+							pBody.put("trigger",List());
+							pBodyStr = pBody.toString();
+							pHdr = Map();
+							useGuard = false;
+							if(curModified != "")
+							{
+								pHdr.put("If-Unmodified-Since",curModified);
+								useGuard = true;
+							}
+							pResp = invokeurl
+							[
+								url :parentUrl
+								type :PUT
+								parameters:pBodyStr
+								headers:pHdr
+								connection:"crm_module"
+							];
+							pStr = ifnull(pResp,"").toString();
+							pCode = "";
+							pMsg = "";
+							if(pStr == "")
+							{
+								pCode = "EMPTY_RESPONSE";
+							}
+							else
+							{
+								pMap = pStr.toMap();
+								pData = pMap.get("data");
+								if(pData != null)
+								{
+									if(pData.size() > 0)
+									{
+										pFirst = pData.get(0);
+										pCode = ifnull(pFirst.get("code"),"").toString();
+										pMsg = ifnull(pFirst.get("message"),"").toString();
+									}
+									else
+									{
+										pCode = "EMPTY_DATA";
+									}
+								}
+								else
+								{
+									pCode = ifnull(pMap.get("code"),"UNKNOWN").toString();
+									pMsg = ifnull(pMap.get("message"),"").toString();
+								}
+							}
+							if(pCode == CODE_SUCCESS)
+							{
+								parentWritten = true;
+								parentWrittenWithGuard = useGuard;
+								if(rollupValid == true)
+								{
+									parentFullWrite = true;
+								}
+							}
+							else if(pCode == CODE_ALREADY_MODIFIED)
+							{
+								if(attemptNo == 1)
+								{
+									retryNeeded = true;
+									noteList.add("412 ALREADY_MODIFIED: 手順2から1回だけやり直す");
+								}
+								else
+								{
+									// 2回目も 412: 状態だけを needs_resync にする（If-Unmodified-Since は付けない）
+									stRec = Map();
+									stRec.put("id",pid);
+									stRec.put("Mirror_Sync_Status",ST_NEEDS_RESYNC);
+									stList = List();
+									stList.add(stRec);
+									stBody = Map();
+									stBody.put("data",stList);
+									stBody.put("trigger",List());
+									stBodyStr = stBody.toString();
+									stResp = invokeurl
+									[
+										url :parentUrl
+										type :PUT
+										parameters:stBodyStr
+										connection:"crm_module"
+									];
+									stStr = ifnull(stResp,"").toString();
+									stCode = "";
+									if(stStr != "")
+									{
+										stMap = stStr.toMap();
+										stData = stMap.get("data");
+										if(stData != null)
+										{
+											if(stData.size() > 0)
+											{
+												stFirst = stData.get(0);
+												stCode = ifnull(stFirst.get("code"),"").toString();
+											}
+										}
+										else
+										{
+											stCode = ifnull(stMap.get("code"),"").toString();
+										}
+									}
+									newStatus = ST_NEEDS_RESYNC;
+									errList.add("PARENT_MODIFIED_TWICE");
+									if(resultCode == RS_SUCCESS)
+									{
+										resultCode = RS_PARTIAL;
+									}
+									if(stCode == CODE_SUCCESS)
+									{
+										parentWritten = true;
+									}
+									else
+									{
+										errList.add("PARENT_STATUS_UPDATE_FAILED code=" + stCode);
+									}
+								}
+							}
+							else
+							{
+								errList.add("PARENT_UPDATE_FAILED code=" + pCode + " msg=" + pMsg);
+								if(resultCode == RS_SUCCESS)
+								{
+									resultCode = RS_PARTIAL;
+								}
+							}
+						}
+					}
+				}
+			}
+			//
+			// ---------- 手順11・12: 親の再読（巻き戻し検出と、書き戻しの読み戻し） ----------
+			if(parentKnown == true && skipFailed == false)
+			{
+				needStaleCheck = false;
+				if(mirrorWriteAttempted == true && parentWrittenWithGuard == false)
+				{
+					needStaleCheck = true;
+				}
+				if(needStaleCheck == true || parentWritten == true)
+				{
+					reRec = Map();
+					reOk = false;
+					try
+					{
+						reGot = zoho.crm.getRecordById(PARENT_MODULE,pid.toLong());
+						if(reGot != null)
+						{
+							reId = ifnull(reGot.get("id"),"").toString();
+							if(reId != "")
+							{
+								reRec = reGot;
+								reOk = true;
+							}
+						}
+					}
+					catch (reEx)
+					{
+						reOk = false;
+					}
+					if(reOk == false)
+					{
+						errList.add("PARENT_REREAD_FAILED");
+						if(resultCode == RS_SUCCESS)
+						{
+							resultCode = RS_PARTIAL;
+						}
+					}
+					else
+					{
+						reModified = ifnull(reRec.get("Modified_Time"),"").toString();
+						reStatus = ifnull(reRec.get("Mirror_Sync_Status"),"").toString();
+						// 手順12: 書いたとおりか（知見集 §3.4）
+						if(parentWritten == true)
+						{
+							rbParentIssue = "";
+							if(reStatus != newStatus)
+							{
+								rbParentIssue = rbParentIssue + " status";
+							}
+							if(parentFullWrite == true)
+							{
+								reTotalRaw = ifnull(reRec.get("Rollup_Total_Amount"),"").toString().trim();
+								reTotalNorm = "";
+								if(reTotalRaw != "")
+								{
+									reTotalNorm = reTotalRaw.toDecimal().round(2).toString();
+								}
+								reCountRaw = ifnull(reRec.get("Rollup_Line_Count"),"").toString().trim();
+								reCountNorm = "";
+								if(reCountRaw != "")
+								{
+									reCountNorm = reCountRaw.toLong().toString();
+								}
+								reLatest = ifnull(reRec.get("Rollup_Latest_Work_Date"),"").toString().trim();
+								if(reTotalNorm != newTotalNorm)
+								{
+									rbParentIssue = rbParentIssue + " total";
+								}
+								if(reCountNorm != newCountNorm)
+								{
+									rbParentIssue = rbParentIssue + " count";
+								}
+								if(reLatest != latestDate)
+								{
+									rbParentIssue = rbParentIssue + " latest";
+								}
+							}
+							if(rbParentIssue != "")
+							{
+								errList.add("PARENT_READBACK_MISMATCH" + rbParentIssue);
+								if(resultCode == RS_SUCCESS)
+								{
+									resultCode = RS_PARTIAL;
+								}
+							}
+						}
+						// 手順11: ミラーを書いたのに親へ（ガード付きで）書けなかったとき、Modified_Time が変わっていれば巻き戻しの恐れ
+						if(needStaleCheck == true && reModified != curModified)
+						{
+							errList.add("STALE_SNAPSHOT modified_time_changed");
+							if(resultCode == RS_SUCCESS)
+							{
+								resultCode = RS_PARTIAL;
+							}
+							if(reStatus != ST_NEEDS_RESYNC && reStatus != ST_FAILED)
+							{
+								skRec = Map();
+								skRec.put("id",pid);
+								skRec.put("Mirror_Sync_Status",ST_NEEDS_RESYNC);
+								skRec.put("Mirror_Last_Error","STALE_SNAPSHOT modified_time_changed");
+								skList = List();
+								skList.add(skRec);
+								skBody = Map();
+								skBody.put("data",skList);
+								skBody.put("trigger",List());
+								skBodyStr = skBody.toString();
+								skResp = invokeurl
+								[
+									url :parentUrl
+									type :PUT
+									parameters:skBodyStr
+									connection:"crm_module"
+								];
+								skStr = ifnull(skResp,"").toString();
+								skCode = "";
+								if(skStr != "")
+								{
+									skMap = skStr.toMap();
+									skData = skMap.get("data");
+									if(skData != null)
+									{
+										if(skData.size() > 0)
+										{
+											skFirst = skData.get(0);
+											skCode = ifnull(skFirst.get("code"),"").toString();
+										}
+									}
+									else
+									{
+										skCode = ifnull(skMap.get("code"),"").toString();
+									}
+								}
+								if(skCode == CODE_SUCCESS)
+								{
+									newStatus = ST_NEEDS_RESYNC;
+									parentWritten = true;
+								}
+								else
+								{
+									errList.add("STALE_STATUS_UPDATE_FAILED code=" + skCode);
+								}
+							}
+						}
+					}
+				}
+			}
+			// 変化なし（ミラーにも親にも書いていない）は skipped
+			if(resultCode == RS_SUCCESS && mirrorWriteAttempted == false && parentWritten == false)
+			{
+				resultCode = RS_SKIPPED;
+			}
+		}
+	}
+	catch (e)
+	{
+		resultCode = RS_FAILED;
+		exLine = e.lineNo;
+		exMsg = e.message;
+		errList.add("EXCEPTION line=" + exLine + " msg=" + exMsg);
+	}
+	//
+	// ---------- 手順13: SFR_Sync_Logs へ結果ログ ----------
+	endedAt = zoho.currenttime.toString(ISO_FMT);
+	detail = "";
+	allMsgs = List();
+	allMsgs.addAll(errList);
+	allMsgs.addAll(noteList);
+	for each  msgItem in allMsgs
+	{
+		if(detail == "")
+		{
+			detail = msgItem;
+		}
+		else
+		{
+			detail = detail + " / " + msgItem;
+		}
+	}
+	if(detail.length() > ERROR_DETAIL_MAX)
+	{
+		detail = detail.subString(0,ERROR_DETAIL_MAX);
+	}
+	logPid = pid;
+	if(logPid.length() > TEXT_MAX)
+	{
+		logPid = logPid.subString(0,TEXT_MAX);
+	}
+	logSrc = src;
+	if(logSrc.length() > TEXT_MAX)
+	{
+		logSrc = logSrc.subString(0,TEXT_MAX);
+	}
+	try
+	{
+		logRecs = List();
+		logType = "";
+		if(snapLogIds.size() > 0)
+		{
+			// 削除予定ログ（delete_planned）を最終結果に更新する
+			logType = "update";
+			for each  snapId in snapLogIds
+			{
+				ur = Map();
+				ur.put("id",snapId);
+				ur.put("Sync_Result",resultCode);
+				ur.put("Added_Count",addedCount);
+				ur.put("Updated_Count",updatedCount);
+				ur.put("Deleted_Count",deletedCount);
+				if(detail != "")
+				{
+					ur.put("Error_Detail",detail);
+				}
+				ur.put("Ended_At",endedAt);
+				logRecs.add(ur);
+			}
+		}
+		else
+		{
+			writeLog = true;
+			if(resultCode == RS_SKIPPED)
+			{
+				// 照合からの無変化の親は個別ログを書かない（D18）。イベント・ボタンは定数で切替
+				if(src == "reconcile" || LOG_SKIPPED == false)
+				{
+					writeLog = false;
+				}
+			}
+			if(writeLog == true)
+			{
+				logType = "insert";
+				nr = Map();
+				nr.put("Name",runId);
+				nr.put("Parent_Record_Id",logPid);
+				nr.put("Sync_Source",logSrc);
+				nr.put("Sync_Result",resultCode);
+				nr.put("Added_Count",addedCount);
+				nr.put("Updated_Count",updatedCount);
+				nr.put("Deleted_Count",deletedCount);
+				if(detail != "")
+				{
+					nr.put("Error_Detail",detail);
+				}
+				nr.put("Started_At",startedAt);
+				nr.put("Ended_At",endedAt);
+				logRecs.add(nr);
+			}
+		}
+		if(logRecs.size() > 0)
+		{
+			lBody = Map();
+			lBody.put("data",logRecs);
+			lBody.put("trigger",List());
+			lBodyStr = lBody.toString();
+			if(logType == "update")
+			{
+				lResp = invokeurl
+				[
+					url :logUrl
+					type :PUT
+					parameters:lBodyStr
+					connection:"crm_module"
+				];
+			}
+			else
+			{
+				lResp = invokeurl
+				[
+					url :logUrl
+					type :POST
+					parameters:lBodyStr
+					connection:"crm_module"
+				];
+			}
+			lStr = ifnull(lResp,"").toString();
+			if(lStr == "")
+			{
+				logError = "EMPTY_RESPONSE";
+			}
+			else
+			{
+				lMap = lStr.toMap();
+				lData = lMap.get("data");
+				if(lData == null)
+				{
+					logError = ifnull(lMap.get("code"),"UNKNOWN").toString();
+				}
+				else
+				{
+					for each  lEl in lData
+					{
+						lCode = ifnull(lEl.get("code"),"").toString();
+						if(lCode != CODE_SUCCESS)
+						{
+							logError = lCode;
+						}
+					}
+				}
+			}
+		}
+	}
+	catch (e2)
+	{
+		logErrLine = e2.lineNo;
+		logError = "LOG_EXCEPTION line=" + logErrLine;
+	}
+	//
+	// ---------- 戻り値 ----------
+	retStatus = newStatus;
+	if(parentGone == true)
+	{
+		retStatus = "gone";
+	}
+	if(skipFailed == true)
+	{
+		retStatus = ST_FAILED;
+	}
+	if(retStatus == "")
+	{
+		retStatus = curStatus;
+	}
+	if(retStatus == "")
+	{
+		retStatus = "unknown";
+	}
+	changedFlag = "0";
+	if(mirrorWritten == true || parentWritten == true)
+	{
+		changedFlag = "1";
+	}
+	firstErr = "";
+	if(errList.size() > 0)
+	{
+		firstErr = errList.get(0);
+		firstErr = firstErr.replaceAll(";",",");
+		if(firstErr.length() > RETURN_ERROR_MAX)
+		{
+			firstErr = firstErr.subString(0,RETURN_ERROR_MAX);
+		}
+	}
+	retStr = resultCode + ";st=" + retStatus + ";a=" + addedCount + ";u=" + updatedCount + ";d=" + deletedCount + ";w=" + changedFlag + ";n=" + rowCount + ";e=" + firstErr;
+	if(logError != "")
+	{
+		logErrSafe = logError.replaceAll(";",",");
+		retStr = retStr + ";log=" + logErrSafe;
+	}
+	info "sfr_sync_core 終了: " + retStr;
+	info "sfr_sync_core 詳細: " + detail;
+	return retStr;
+}

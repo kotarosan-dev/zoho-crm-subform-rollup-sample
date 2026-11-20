@@ -1,0 +1,113 @@
+string button.sfr_resync_button(String parentId)
+{
+	// ==================================================================
+	// function_name     : sfr_resync_button
+	// category          : button（SFR_Projects の詳細画面に置く。制限時間 10 秒）
+	// arguments         : parentId (String) カレントレコード（SFR_Projects）のレコード ID
+	// return            : String 結果の要約（画面に表示される）
+	// motivation        : 手動再同期の入口。テスト T22・T30 など同期のテスト用入口も兼ねる
+	//                     failed（手動対応）の親でも実行し、成功すれば Mirror_Fail_Count を 0 に戻す（§6-2）
+	// processing_flow   : sfr_sync_core を source="button" で呼び、戻り値を分解して要約文字列を返す
+	// related_functions : sfr_sync_core（standalone 本体）
+	// ==================================================================
+	msg = "";
+	try
+	{
+		ret = standalone.sfr_sync_core(parentId,"button");
+		retText = ifnull(ret,"").toString();
+		retParts = retText.toList(";");
+		rRes = "";
+		rSt = "";
+		rA = "0";
+		rU = "0";
+		rD = "0";
+		rErr = "";
+		partNo = 0;
+		for each  rp in retParts
+		{
+			partNo = partNo + 1;
+			if(partNo == 1)
+			{
+				rRes = rp.replaceAll("_","");
+			}
+			else if(rp.startsWith("st="))
+			{
+				rSt = rp.getSuffix("=").replaceAll("_","");
+			}
+			else if(rp.startsWith("a="))
+			{
+				rA = rp.getSuffix("=");
+			}
+			else if(rp.startsWith("u="))
+			{
+				rU = rp.getSuffix("=");
+			}
+			else if(rp.startsWith("d="))
+			{
+				rD = rp.getSuffix("=");
+			}
+			else if(rp.startsWith("e="))
+			{
+				rErr = rp.getSuffix("=");
+			}
+		}
+		// 戻り値の文字列からアンダースコアが消えることがある（知見集 §5.2）ので、比較は "_" を除いた形で行う
+		resLabel = "不明";
+		if(rRes == "success")
+		{
+			resLabel = "同期しました";
+		}
+		else if(rRes == "skipped")
+		{
+			resLabel = "変更はありませんでした";
+		}
+		else if(rRes == "partial")
+		{
+			resLabel = "一部失敗しました（照合で再試行されます）";
+		}
+		else if(rRes == "failed")
+		{
+			resLabel = "失敗しました（何も削除していません）";
+		}
+		else if(rRes == "outofspec")
+		{
+			resLabel = "仕様外（行数が上限を超えています）のため同期していません";
+		}
+		stLabel = rSt;
+		if(rSt == "synced")
+		{
+			stLabel = "同期済み";
+		}
+		else if(rSt == "needsresync")
+		{
+			stLabel = "要再同期";
+		}
+		else if(rSt == "failed")
+		{
+			stLabel = "失敗（手動対応）";
+		}
+		else if(rSt == "outofspec")
+		{
+			stLabel = "仕様外";
+		}
+		else if(rSt == "gone")
+		{
+			stLabel = "親レコードなし";
+		}
+		msg = "再同期: " + resLabel + "\n状態: " + stLabel + "\nミラー 追加 " + rA + " 件・更新 " + rU + " 件・削除 " + rD + " 件";
+		if(rErr != "")
+		{
+			msg = msg + "\n詳細: " + rErr;
+		}
+		info "sfr_resync_button 終了: " + retText;
+		return msg;
+	}
+	catch (e)
+	{
+		exMsg = e.message;
+		msg = "再同期でエラーが発生しました: " + exMsg;
+		info msg;
+		return msg;
+	}
+	return "";
+}

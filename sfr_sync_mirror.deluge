@@ -1,0 +1,14 @@
+void automation.sfr_sync_mirror(String parentId)
+{
+	// ==================================================================
+	// function_name     : sfr_sync_mirror
+	// category          : automation（ワークフロールール「作成または編集時」1本から呼ぶ。制限時間 30 秒）
+	// arguments         : parentId (String) SFR_Projects のレコード ID（ルールの差し込み項目でレコード ID を渡す）
+	// return            : void
+	// motivation        : 親の作成・編集（サブフォームだけの編集でも発火。P0-02）のたびに差分同期を起こす薄い包み
+	// processing_flow   : sfr_sync_core を source="workflow" で呼び、結果を実行ログに残すだけ
+	// related_functions : sfr_sync_core（standalone 本体）
+	// ==================================================================
+	ret = standalone.sfr_sync_core(parentId,"workflow");
+	info "sfr_sync_mirror 終了: " + ret;
+}

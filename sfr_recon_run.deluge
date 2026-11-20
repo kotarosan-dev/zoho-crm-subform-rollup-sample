@@ -1,0 +1,15 @@
+string standalone.sfr_recon_run()
+{
+	// ==================================================================
+	// function_name     : sfr_recon_run
+	// category          : standalone（テスト用の補助関数）
+	// arguments         : なし
+	// return            : String "done"
+	// motivation        : スケジュール関数 sfr_reconcile をオンデマンド実行できるか試すための薄い包み
+	// processing_flow   : schedule.sfr_reconcile() を呼び、"done" を返す
+	// related_functions : sfr_reconcile（schedule）
+	// 注意              : schedule 関数を他の関数から呼べることは、テスト T07 の再実施で実証済み（この関数はそのオンデマンド実行のためにある）
+	// ==================================================================
+	schedule.sfr_reconcile();
+	return "done";
+}
